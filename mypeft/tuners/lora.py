@@ -24,6 +24,7 @@ import torch.nn as nn
 from torch.nn import Parameter
 import torch.nn.functional as F
 from transformers.pytorch_utils import Conv1D
+import copy
 
 from ..import_utils import is_bnb_available
 from ..utils import (
@@ -443,29 +444,24 @@ class LoraLayer:
         self.out_features = out_features
 
         self.deterministic = False
-        self.num_mc_samples = 4 # number of ensembled models
         self.pert_init_std = 2
-        # self.pert_init_std = 0.2
         self.random_integer = None
         self.is_generation_mode = False
         self.mylora_A = nn.ModuleDict({})
         self.mylora_B = nn.ModuleDict({})
-        # r=8
-        # self.weight_mu = Parameter(torch.Tensor(out_features, in_features)))
-        # self.lora_A_in_weights = nn.ParameterDict({})
-        # self.lora_A_out_weights = nn.ParameterDict({})
-
-        # self.lora_B_in_weights = nn.ParameterDict({})
-        # self.lora_B_out_weights = nn.ParameterDict({})
-        # self.feature_cov = None
-        self.lora_feature_cov = nn.ParameterDict({})
-        # self.lora_tau = nn.ParameterDict({})
         self.momentum = 0.95
         self.training = False
         self.select_dataset = None
-        # self.init_cov=True
-        self.init_cov_idx = [True] * 4
-        self.dataset_indexs={"gsm8k":0, "boolq":1, "piqa":2, "tsa":3}
+
+        self.num_mc_samples = 4
+        self.init_task = True
+        self.dataset_indexs={"general":0, "tsa":1, "boolq":2, "agnews":3, "gsm8k":4}
+
+        self.lora_P_X_pre = nn.ParameterDict({})
+        self.lora_P_X_now = nn.ParameterDict({})
+        self.lora_P_H_pre = nn.ParameterDict({})
+        self.lora_P_H_now = nn.ParameterDict({})
+
 
     def update_layer(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights):
 
@@ -482,24 +478,18 @@ class LoraLayer:
             for dataset_name, x in self.dataset_indexs.items():
                 self.mylora_A.update(nn.ModuleDict({dataset_name: nn.Linear(self.in_features, r, bias=False)}))
                 self.mylora_B.update(nn.ModuleDict({dataset_name: nn.Linear(r, self.out_features, bias=False)}))
+
             self.lora_A.update(nn.ModuleDict({adapter_name: nn.Linear(self.in_features, r, bias=False)}))
             self.lora_B.update(nn.ModuleDict({adapter_name: nn.Linear(r, self.out_features, bias=False)}))
-            # self.lora_feature_cov.update(nn.ParameterDict({adapter_name: torch.zeros(self.in_features, self.num_mc_samples, self.num_mc_samples)}))
-            self.lora_feature_cov.update(nn.ParameterDict({adapter_name: torch.zeros(self.num_mc_samples, self.num_mc_samples)}))
-            self.lora_feature_cov[adapter_name].requires_grad=False
 
-            # self.lora_tau.update(nn.ParameterDict({"gsm8k": nn.Parameter(torch.ones(1) * 1)}))
-            # self.lora_tau.update(nn.ParameterDict({"wealth": nn.Parameter(torch.ones(1) * 0)}))
-            # self.lora_tau.update(nn.ParameterDict({"code": nn.Parameter(torch.ones(1) * 0)}))
-            # self.lora_tau.update(nn.ParameterDict({"alpaca": nn.Parameter(torch.ones(1) * -1)}))
+            self.lora_P_X_pre.update(nn.ParameterDict({adapter_name: nn.Parameter(torch.eye(self.in_features))}))
+            self.lora_P_X_now.update(nn.ParameterDict({adapter_name: nn.Parameter(torch.eye(self.in_features))}))
+            self.lora_P_H_pre.update(nn.ParameterDict({adapter_name: nn.Parameter(torch.eye(r))}))
+            self.lora_P_H_now.update(nn.ParameterDict({adapter_name: nn.Parameter(torch.eye(r))}))
 
-            # self.lora_tau.update(nn.ParameterDict({adapter_name: nn.Parameter(torch.ones(1) * 0)})) # after softplus: tensor([0.0486]
-            # self.lora_tau.update(nn.ParameterDict({adapter_name: nn.Parameter(torch.ones(1) * 0.1)}))
-            # self.register_parameter("lora_feature_cov", None)
             self.scaling[adapter_name] = lora_alpha / r
         if init_lora_weights:
             self.reset_lora_parameters(adapter_name)
-            # self.my_reset_parameters(adapter_name)
         self.to(self.weight.device)
 
     def update_layer_embedding(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights):
@@ -536,7 +526,6 @@ class LoraLayer:
             nn.init.normal_(self.lora_embedding_B[adapter_name])
         for dataset_name, _ in self.dataset_indexs.items():
             nn.init.kaiming_uniform_(self.mylora_A[dataset_name].weight, a=math.sqrt(5))
-            # nn.init.kaiming_uniform_(self.mylora_B[dataset_name].weight, a=math.sqrt(5))
             nn.init.zeros_(self.mylora_B[dataset_name].weight)
 
 
@@ -747,169 +736,178 @@ if is_bnb_available():
                 (lora_embedding_B): ParameterDict()
                 )
             """
-            # exit(0)
+
             self.weight.requires_grad = False
-            # print(self.weight) # 原线性层的weight，就一个矩阵W
             init_lora_weights = kwargs.pop("init_lora_weights", True)
             self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights)
-            # self.my_reset_parameters()
             self.active_adapter = adapter_name
 
             self.parallel_eval = False
 
         def forward(self, x: torch.Tensor):
 
-            if not torch.is_autocast_enabled(): # generate 走这个
-                # self.select_dataset = "gsm8k"
-                # self.select_dataset = "boolq"
-                # self.select_dataset = "piqa"
-                self.select_dataset = "tsa"
-
-            self.dataset_index = self.dataset_indexs[self.select_dataset]
-            self.lora_feature_cov[self.active_adapter].requires_grad = False
-
-            if self.dataset_index > 0:
-                for dict_name, dict_index in self.dataset_indexs.items():
-                    if dict_index < self.dataset_index:
-                        # print("detach",dict_name)
-                        self.mylora_A[dict_name].weight.requires_grad = False
-                        self.mylora_B[dict_name].weight.requires_grad = False
             result = super().forward(x)
 
-            # bs = x.shape[0]
-            # print("self.active_adapter",self.active_adapter)
-            # print("self.active_adapte type",type(self.active_adapter))
             if self.disable_adapters or self.active_adapter not in self.lora_A.keys():
                 return result
             elif self.r[self.active_adapter] > 0:
-                # print("x.dtype",x.dtype) #x.dtype torch.float16
-                if not torch.is_autocast_enabled(): # generate 走这个
-                    # print("torch.is_autocast_enabled()")
-                    expected_dtype = result.dtype
+                if not torch.is_autocast_enabled(): # generate
+                    
                     if x.dtype != torch.float32:
                         x = x.float()
 
-                    flag = True
-                    for dataset_name,_ in self.dataset_indexs.items():
-                        output_A = self.mylora_A[dataset_name](self.lora_dropout[self.active_adapter](x))
-                        # tmp = output_A.view(-1,output_A.shape[-1]).unsqueeze(-1) if flag else torch.cat((tmp, output_A.view(-1,output_A.shape[-1]).unsqueeze(-1)),dim=-1)
-                        tmp = output_A.view(-1,1) if flag else torch.cat((tmp, output_A.view(-1,1)),dim=-1)
-                        flag = False
-                    batch_cov = self.lora_feature_cov[self.active_adapter][:self.dataset_index+1,:self.dataset_index+1]
-                    # batch_cov.diagonal(dim1=-2, dim2=-1).add_(1e-7)
-                    # batch_cov = self.lora_feature_cov[self.active_adapter]
-                    L = psd_safe_cholesky(batch_cov)
-                    L_inv_T = L.inverse().transpose(-2, -1)
-                    # output = torch.einsum("ldn, dnm->ldm", tmp, L_inv_T)[:,:,self.dataset_index].squeeze().reshape(x.shape[0],x.shape[1],-1)
-                    # output = torch.einsum("ldn, dnm->ldm", tmp[:,:,:self.dataset_index+1], L_inv_T)[:,:,self.dataset_index].squeeze().reshape(x.shape[0],x.shape[1],-1)
-                    output = torch.einsum("ij, jk->ik", tmp[:,:self.dataset_index+1], L_inv_T)[:,self.dataset_index].squeeze().reshape(x.shape[0],x.shape[1],-1)
-                    # output = output * torch.nn.functional.softplus(self.lora_tau[self.select_dataset])
-                    # output = output / math.sqrt(tmp.shape[0])
-                    output = output * math.log(1 + math.exp(-1.5)) # 🌟🌟🌟🌟🌟🌟🌟🌟🌟🌟
-                    output = (
-                        self.mylora_B[self.select_dataset](output)* self.scaling[self.active_adapter]
-                    )
-                else: # train 时候这条路
-                    flag = True
-                    for dataset_name, idx in self.dataset_indexs.items():
-                        # if idx > self.dataset_index:
-                        #     break
-                        output_A = self.mylora_A[dataset_name](self.lora_dropout[self.active_adapter](x))
-                        # print("output_A shape",output_A.shape) #output_A shape torch.Size([8, 352, 16])
-                        tmp = output_A.view(-1,1) if flag else torch.cat((tmp, output_A.view(-1,1)),dim=-1)
-                        flag = False
+                    self.lora_P_X_pre[self.active_adapter].requires_grad = False
+                    self.lora_P_X_now[self.active_adapter].requires_grad = False
+                    self.lora_feature_cov[self.active_adapter].requires_grad = False
 
-                    # print("tmp.shape",tmp.shape)#tmp.shape torch.Size([2816, 16, 4])
-                    # print("tmp.max",tmp.max()) 
-                    tmp=tmp.float()
-                    
-                    batch_cov = torch.einsum("ij, jk->ik", tmp[:,:self.dataset_index+1].permute(1,0)/math.sqrt(tmp.shape[0]), tmp[:,:self.dataset_index+1]/math.sqrt(tmp.shape[0]))#?
-                    # batch_cov = torch.einsum("ijk, ikl->ijl", tmp.permute(1, 2, 0)/math.sqrt(tmp.shape[0]), tmp.permute(1, 0, 2)/math.sqrt(tmp.shape[0]))#?
-                    # batch_cov = torch.einsum("ijk, ikl->ijl", tmp[:,:,:self.dataset_index+1].permute(1, 2, 0), tmp[:,:,:self.dataset_index+1].permute(1, 0, 2))#?
-                    batch_cov = batch_cov.float()
-                    # print("batch_cov[0]",batch_cov[0])
-                    # print("batch_cov[1]",batch_cov[1])
-                    # print("batch_cov[2]",batch_cov[2])
-                    # print("batch_cov max",batch_cov.max())
-                    with torch.no_grad():
-                        if self.init_cov_idx[self.dataset_index]:
-                            self.lora_feature_cov[self.active_adapter][self.dataset_index:self.dataset_index+1,:self.dataset_index+1] = batch_cov[self.dataset_index:self.dataset_index+1,:self.dataset_index+1]
-                            self.lora_feature_cov[self.active_adapter][:self.dataset_index,self.dataset_index:self.dataset_index+1] = batch_cov[:self.dataset_index,self.dataset_index:self.dataset_index+1]
-                            self.init_cov_idx[self.dataset_index] = False
+                    for dict_name, dict_index in self.dataset_indexs.items():
+                        self.mylora_A[dict_name].weight.requires_grad = False
+                        self.mylora_B[dict_name].weight.requires_grad = False
+
+                    self.dataset_index = 1
+                    self.select_dataset = 'boolq'
+
+                    x_li = torch.einsum('id, bsd->bsi', self.lora_P_X_pre[self.active_adapter], x) # (b,s,d)
+                    # print('\n P_X_pre', self.lora_P_X_pre[self.active_adapter])
+                    # print('x_li', torch.max(torch.abs(x_li)), torch.min(torch.abs(x_li)))
+                    # print(x_li)
+                    # print('x', torch.max(torch.abs(x)), torch.min(torch.abs(x)))
+                    # print(x)
+
+                    for idx, dataset_name in enumerate(self.dataset_indexs):
+                        if idx == self.dataset_index:
+                            output_A = self.mylora_A[dataset_name](self.lora_dropout[self.active_adapter](x_li)) # (b,s,r)
                         else:
-                            self.lora_feature_cov[self.active_adapter][self.dataset_index:self.dataset_index+1,:self.dataset_index+1].mul_(self.momentum).add_(batch_cov[self.dataset_index:self.dataset_index+1,:self.dataset_index+1], alpha=1-self.momentum)
-                            self.lora_feature_cov[self.active_adapter][:self.dataset_index,self.dataset_index:self.dataset_index+1].mul_(self.momentum).add_(batch_cov[:self.dataset_index,self.dataset_index:self.dataset_index+1], alpha=1-self.momentum)
-                    # print("self.lora_feature_cov[self.active_adapter] max",self.lora_feature_cov[self.active_adapter].max())
-                    # batch_cov.diagonal(dim1=-2, dim2=-1).add_(1e-7)
-                    # batch_cov = self.lora_feature_cov[self.active_adapter][:,:self.dataset_index+1,:self.dataset_index+1]
-                    L = psd_safe_cholesky(batch_cov)
-                    # print("L.dtype",L.dtype) #float32
-                    L_inv_T = L.inverse().transpose(-2, -1)
-                    # print("L_inv_T.dtype",L_inv_T.dtype) # float32
-                    # print("L_inv_T.max",L_inv_T.max())
-                    # print("L_inv_T shape",L_inv_T.shape) #L_inv_T shape torch.Size([4096, self.dataset_index+1, self.dataset_index+1])
-                    # print("self.dataset_index",self.dataset_index)
-                    output = torch.einsum("ij, jk->ik", tmp[:,:self.dataset_index+1], L_inv_T)[:,self.dataset_index].squeeze().reshape(x.shape[0],x.shape[1],-1)
-                    # print("output shape",output.shape) #output shape torch.Size([32, 256, 4096])
-                    # print("output.max()",output.max())
-                    # print("torch.nn.functional.softplus(self.lora_tau[self.active_adapter])",torch.nn.functional.softplus(self.lora_tau[self.active_adapter]))
-                    # output = output * torch.nn.functional.softplus(self.lora_tau[self.select_dataset])
-                    output = output * math.log(1 + math.exp(-1.5)) # 🌟🌟🌟🌟🌟🌟🌟🌟🌟🌟
-                    # print("lora_tau", self.lora_tau[self.select_dataset])
-                    # output = output / math.sqrt(tmp.shape[0])
-                    output = (
-                        self.mylora_B[self.select_dataset](output)* self.scaling[self.active_adapter]
-                    )
+                            output_A = self.mylora_A[dataset_name](self.lora_dropout[self.active_adapter](x)) # (b,s,r)
+                        # if torch.isnan(output_A).any():
+                        #     print(f"Error: output_A contains nan, idx: {idx}")
+                        # print(output_A)
+                        # if torch.isnan(self.mylora_A[dataset_name].weight).any():
+                        #     print(f"Error: mylora_A weight contains nan, idx: {idx}")
+                        # print(self.mylora_A[dataset_name].weight)
+                        #     # exit(1)
+                        h = output_A.unsqueeze(0) if idx==0 else torch.cat((h, output_A.unsqueeze(0)),dim=0) # (n,b,s,r)
 
-                    # print("output after.max()",output.max())
-                    # print("output dtype",output.dtype)
-                    # print("self.select_dataset index",self.dataset_index)
-                    # print("self.mylora_B[self.select_dataset].weight.max()",self.mylora_B[self.select_dataset].weight.max())
-                result += output
-                # exit()
+                    n, b, s, r, m = h.shape[0], h.shape[1], h.shape[2], h.shape[3], self.dataset_index+1
+
+                    h_merge_bs = h.permute(3,0,1,2).reshape(r,n,-1) # (r,n,b*s)
+                    # if torch.isnan(h_merge_bs).any():
+                    #     print(f"Error: h_merge_bs contains nan")
+                    #     # print(h_merge_bs)
+                    #     # exit(1)
+
+                    # batch_cov = self.lora_feature_cov[self.active_adapter][:,:m,:m] # (r,m,m)
+                    batch_cov = torch.einsum("rmj, rnj->rmn", h_merge_bs[:,:m,:], h_merge_bs[:,:m,:]) / (b * s) # (r,m,m)
+                    batch_cov = batch_cov.float()
+
+                    h_tilde_merge_bs = torch.zeros(r,m,b*s).to(h_merge_bs.device) # (r,m,b*s)
+                    for i in range(r):
+                        L = psd_safe_cholesky(batch_cov[i]) # (m,m)
+
+                        if torch.isnan(L).any():
+                            print(f"\nError: L contains nan, i: {i}")
+                            print(f'batch_cov[{i}]:\n', batch_cov[i])
+                            print('batch_cov type:', batch_cov[i].dtype)
+                            print('L:\n', L)
+                            print('L type:', L.dtype)
+                            
+                            exit(1)
+                        L_inv = L.inverse() # (m,m)
+                        h_tilde_merge_bs[i] = L_inv @ h_merge_bs[i,:m,:] # (m,b*s)
+                    h_tilde = h_tilde_merge_bs.permute(1,2,0).reshape(m,b,s,r) # (m,b,s,r)
+
+                    # h_tilde = h
+                    for idx, dataset_name in enumerate(self.dataset_indexs):
+                        if idx < m:
+                            output_B = self.mylora_B[dataset_name](h_tilde[idx]) # (b,s,d)
+                            # if torch.isnan(output_B).any():
+                            #     print(f"Error: output_B contains nan, idx: {idx}")
+                            #     print(output_B)
+                            #     # exit(1)
+                            Y = output_B.unsqueeze(0) if idx==0 else torch.cat((Y, output_B.unsqueeze(0)),dim=0) # (m,b,s,d)
+                    
+                    # if torch.isnan(Y).any():
+                    #     print("Error: Y contains nan")
+                    #     # exit(1)
+
+                    
+                    result += Y.sum(dim=0) * self.scaling[self.active_adapter]
+                
+                else: # train
+
+                    self.dataset_index = self.dataset_indexs[self.select_dataset]
+
+                    self.lora_P_X_pre[self.active_adapter].requires_grad = False
+                    self.lora_P_X_now[self.active_adapter].requires_grad = False
+                    self.lora_P_H_pre[self.active_adapter].requires_grad = False
+                    self.lora_P_H_now[self.active_adapter].requires_grad = False
+
+                    for dict_name, dict_index in self.dataset_indexs.items():
+                        if dict_index != self.dataset_index and dict_index > 0:
+                            self.mylora_A[dict_name].weight.requires_grad = False
+                            self.mylora_B[dict_name].weight.requires_grad = False
+                    
+                    if self.init_task:
+                        self.init_task = False
+                        if self.dataset_index > 1:
+                            self.lora_P_X_pre[self.active_adapter].data = self.lora_P_X_now[self.active_adapter].data.clone().detach()
+                            self.lora_P_H_pre[self.active_adapter].data = self.lora_P_H_now[self.active_adapter].data.clone().detach()
+                            self.mylora_A[self.select_dataset].weight = nn.Parameter(self.mylora_A[list(self.dataset_indexs.keys())[self.dataset_index-1]].weight.clone().detach())
+
+                    with torch.no_grad():
+                        x_mean = x.mean(dim=(0,1)).unsqueeze(0) # (1,d)
+                        lambda_ = 1
+                        k_X = self.lora_P_X_now[self.active_adapter] @ x_mean.T / (lambda_ + x_mean @ self.lora_P_X_now[self.active_adapter] @ x_mean.T) # (d,1)
+                        self.lora_P_X_now[self.active_adapter] = (self.lora_P_X_now[self.active_adapter] - k_X @ x_mean @ self.lora_P_X_now[self.active_adapter]) / lambda_ # (d,d)
+
+
+                    for idx, dataset_name in enumerate(self.dataset_indexs):
+                        output_A = self.mylora_A[dataset_name](self.lora_dropout[self.active_adapter](x)) # (b,s,r)
+                        h = output_A.unsqueeze(0) if idx==0 else torch.cat((h, output_A.unsqueeze(0)),dim=0) # (n,b,s,r)
+
+                    n, b, s, r, m = h.shape[0], h.shape[1], h.shape[2], h.shape[3], self.dataset_index+1
+
+                    with torch.no_grad():
+                        h_mean = h[self.dataset_index].mean(dim=(0,1)).unsqueeze(0) # (1,r)
+                        lambda_ = 1
+                        k_H = self.lora_P_H_now[self.active_adapter] @ h_mean.T / (lambda_ + h_mean @ self.lora_P_H_now[self.active_adapter] @ h_mean.T) # (r,1)
+                        self.lora_P_H_now[self.active_adapter] = (self.lora_P_H_now[self.active_adapter] - k_H @ h_mean @ self.lora_P_H_now[self.active_adapter]) / lambda_ # (r,r)
+
+
+                    for idx, dataset_name in enumerate(self.dataset_indexs):
+                        if idx >= m:
+                            break
+                        output_B = self.mylora_B[dataset_name](h[idx]) # (b,s,d)
+                        Y = output_B.unsqueeze(0) if idx==0 else torch.cat((Y, output_B.unsqueeze(0)),dim=0) # (m,b,s,d)
+                    
+                    result += Y.sum(dim=0) * self.scaling[self.active_adapter]
+
                 return result
 
 
-def psd_safe_cholesky(A, upper=False, out=None, jitter=None):
-	"""Compute the Cholesky decomposition of A. If A is only p.s.d, add a small jitter to the diagonal.
-	Args:
-		:attr:`A` (Tensor):
-			The tensor to compute the Cholesky decomposition of
-		:attr:`upper` (bool, optional):
-			See torch.cholesky
-		:attr:`out` (Tensor, optional):
-			See torch.cholesky
-		:attr:`jitter` (float, optional):
-			The jitter to add to the diagonal of A in case A is only p.s.d. If omitted, chosen
-			as 1e-6 (float) or 1e-8 (double)
-	"""
-	try:
-		L = torch.linalg.cholesky(A, upper=upper, out=out)
-		return L
-	except RuntimeError as e:
-		isnan = torch.isnan(A)
-		if isnan.any():
-			raise ValueError(
-				f"cholesky_cpu: {isnan.sum().item()} of {A.numel()} elements of the {A.shape} tensor are NaN."
-			)
+# from classy_vision.generic.distributed_util import (
+#     convert_to_distributed_tensor,
+#     convert_to_normal_tensor,
+#     is_distributed_training_run,
+# )
 
-		if jitter is None:
-			jitter = 1e-6 if A.dtype == torch.float32 else 1e-8
-		Aprime = A.clone()
-		jitter_prev = 0
-		for i in range(10):
-			jitter_new = jitter * (10 ** i)
-			Aprime.diagonal(dim1=-2, dim2=-1).add_(jitter_new - jitter_prev)
-			jitter_prev = jitter_new
-			try:
-				L = torch.linalg.cholesky(Aprime, upper=upper, out=out)
-				warnings.warn(
-					f"A not p.d., added jitter of {jitter_new} to the diagonal",
-					RuntimeWarning,
-				)
-				return L
-			except RuntimeError:
-				continue
-		# return torch.randn_like(A).tril()
-		raise e
+# def gather_from_all(tensor: torch.Tensor) -> torch.Tensor:
+#     """
+#     Similar to classy_vision.generic.distributed_util.gather_from_all
+#     except that it does not cut the gradients
+#     """
+#     if tensor.ndim == 0:
+#         # 0 dim tensors cannot be gathered. so unsqueeze
+#         tensor = tensor.unsqueeze(0)
 
+#     if is_distributed_training_run():
+#         tensor, orig_device = convert_to_distributed_tensor(tensor)
+#         # gathered_tensors = GatherLayer.apply(tensor)
+#         gathered_tensors = [
+#             convert_to_normal_tensor(_tensor, orig_device)
+#             for _tensor in gathered_tensors
+#         ]
+#     else:
+#         gathered_tensors = [tensor]
+#     gathered_tensor = torch.cat(gathered_tensors, 0)
+#     return gathered_tensor
