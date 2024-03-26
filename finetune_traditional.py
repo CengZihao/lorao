@@ -1,21 +1,14 @@
 import os
 import sys
 from typing import List
-
 import fire
 import torch
 import transformers
-from datasets import load_dataset, concatenate_datasets
+from transformers import LlamaForCausalLM, LlamaTokenizer
+from datasets import load_dataset
 import wandb
 import random
 import numpy as np
-
-"""
-Unused imports:
-import torch.nn as nn
-import bitsandbytes as bnb
-"""
-
 from peft import (
     LoraConfig,
     get_peft_model,
@@ -23,44 +16,36 @@ from peft import (
     prepare_model_for_int8_training,
     set_peft_model_state_dict,
 )
-
-# import mytransformers
-# from mytransformers.src.transformers import LlamaForCausalLM, LlamaTokenizer
-from transformers import LlamaForCausalLM, LlamaTokenizer
-
 from utils.prompter import Prompter
+
+from my_trainer import MyTrainer
+
 
 
 def seed_torch(seed=42):
-    random.seed(seed)   # Python的随机性
-    os.environ['PYTHONHASHSEED'] = str(seed)    # 设置Python哈希种子，为了禁止hash随机化，使得实验可复现
-    np.random.seed(seed)   # numpy的随机性
-    torch.manual_seed(seed)   # torch的CPU随机性，为CPU设置随机种子
-    torch.cuda.manual_seed(seed)   # torch的GPU随机性，为当前GPU设置随机种子
-    torch.cuda.manual_seed_all(seed)  # if you are using multi-GPU.   torch的GPU随机性，为所有GPU设置随机种子
-    torch.backends.cudnn.benchmark = False   # if benchmark=True, deterministic will be False
-    torch.backends.cudnn.deterministic = True   # 选择确定性算法
+    random.seed(seed) # Python 的随机性
+    os.environ['PYTHONHASHSEED'] = str(seed) # 设置 Python 哈希种子，为了禁止 hash 随机化，使得实验可复现
+    np.random.seed(seed) # numpy的随机性
+    torch.manual_seed(seed) # torch 的 CPU 随机性，为 CPU 设置随机种子
+    torch.cuda.manual_seed(seed) # torch 的 GPU 随机性，为当前 GPU 设置随机种子
+    torch.cuda.manual_seed_all(seed) # 使用多 GPU 时需要，为所有 GPU 设置随机种子
+    torch.backends.cudnn.benchmark = False # 关闭 benchmark，提高稳定性
+    torch.backends.cudnn.deterministic = True # 确保 cudnn 的实现是确定的
     print("fix seed")
 
 seed_torch()
 
 
+
 def train(
-    # model/data params
-    # base_model: str = "decapoda-research/llama-7b-hf",
-    base_model: str = "yahma/llama-7b-hf",  # the only required argument
-    general_data_path: str = "yahma/alpaca-cleaned",
+    base_model: str = "yahma/llama-7b-hf",
     output_dir: str = "./lora-alpaca/olora",
     # training hyperparams
     batch_size: int = 128,
     micro_batch_size: int = 8,
-    # batch_size: int = 32,
-    # micro_batch_size: int = 16,
     num_epochs: int = 1,
     learning_rate: float = 3e-4,
-    # learning_rate: float = 4.1,
-    cutoff_len: int = 512,
-    # val_set_size: int = 16,
+    cutoff_len: int = 512, # 输入 token 的最大长度
     val_set_size: int = 1000,
     # lora hyperparams
     lora_r: int = 16,
@@ -73,23 +58,22 @@ def train(
         "o_proj",
     ],
     # llm hyperparams
-    train_on_inputs: bool = False,  # if False, masks out inputs in loss
+    train_on_inputs: bool = False,
     add_eos_token: bool = False,
-    group_by_length: bool = False,  # faster, but produces an odd training loss curve
+    group_by_length: bool = False,
     # wandb params
+    select_dataset: str = "",
     wandb_project: str = "debug",
     wandb_run_name: str = "",
-    wandb_watch: str = "",  # options: false | gradients | all
-    wandb_log_model: str = "",  # options: false | true
-    resume_from_checkpoint: str = None,  # either training checkpoint or final adapter
-    # resume_from_checkpoint: str = "output/1211tau_3_gsm",  
-    prompt_template_name: str = "alpaca",  # The prompt template to use, will default to alpaca.
+    wandb_watch: str = "", # options: false | gradients | all
+    wandb_log_model: str = "", # options: false | true
+    resume_from_checkpoint: str = None, # either training checkpoint or final adapter
+    prompt_template_name: str = "alpaca", # The prompt template to use, will default to alpaca.
 ):
     if int(os.environ.get("LOCAL_RANK", 0)) == 0: #master gpu卡
         print(
             f"Training Alpaca-LoRA model with params:\n"
             f"base_model: {base_model}\n"
-            f"general_data_path: {general_data_path}\n"
             f"output_dir: {output_dir}\n"
             f"batch_size: {batch_size}\n"
             f"micro_batch_size: {micro_batch_size}\n"
@@ -104,6 +88,7 @@ def train(
             f"train_on_inputs: {train_on_inputs}\n"
             f"add_eos_token: {add_eos_token}\n"
             f"group_by_length: {group_by_length}\n"
+            f"select_dataset: {select_dataset}\n"
             f"wandb_project: {wandb_project}\n"
             f"wandb_run_name: {wandb_run_name}\n"
             f"wandb_watch: {wandb_watch}\n"
@@ -111,25 +96,28 @@ def train(
             f"resume_from_checkpoint: {resume_from_checkpoint or False}\n"
             f"prompt template: {prompt_template_name}\n"
         )
+    
     assert (
         base_model
     ), "Please specify a --base_model, e.g. --base_model='huggyllama/llama-7b'"
+    
     gradient_accumulation_steps = batch_size // micro_batch_size
     
     prompter = Prompter(prompt_template_name)
 
     device_map = "auto"
-    world_size = int(os.environ.get("WORLD_SIZE", 1)) #world_size=1
-    # print("world_size",world_size) # 1
+    world_size = int(os.environ.get("WORLD_SIZE", 1)) # WORLD_SIZE 表示进程总数
     ddp = world_size != 1
-    if ddp: #ddp=False
-        device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)}
+    if ddp:
+        device_map = {"": int(os.environ.get("LOCAL_RANK") or 0)} # LOCAL_RANK 表示某一 GPU 卡的编号
         gradient_accumulation_steps = gradient_accumulation_steps // world_size
-    # Check if parameter passed or if set within environ
+    
+
+    # wandb 配置
     use_wandb = len(wandb_project) > 0 or (
         "WANDB_PROJECT" in os.environ and len(os.environ["WANDB_PROJECT"]) > 0
     )
-    # Only overwrite environ if wandb param passed
+        # 检查是否提供了 wandb_project 参数 or 环境变量 WANDB_PROJECT 已设置，以决定是否使用 wandb 进行日志记录
     if len(wandb_project) > 0:
         os.environ["WANDB_PROJECT"] = wandb_project
     if len(wandb_watch) > 0:
@@ -138,25 +126,44 @@ def train(
         os.environ["WANDB_LOG_MODEL"] = wandb_log_model
 
 
-    # gsm8k_data = load_dataset("json", data_files="/data/zzh/olora/gsm8k/train.json")
-    # print("gsm8k_data", gsm8k_data)
+    if select_dataset == "gsm8k":
+        gsm8k_data = load_dataset("json", data_files="/data/zzh/olora/datasets/gsm8k/train.jsonl")
+        print("gsm8k_data", gsm8k_data)
+    elif select_dataset == "wealth":
+        wealth_data = load_dataset("json", data_files="/data/zzh/olora/datasets/wealth/train.jsonl")
+        print("wealth_data", wealth_data)
+    elif select_dataset == "code":
+        code_data = load_dataset("json", data_files="/data/zzh/olora/datasets/code/train_mod.jsonl")
+        print("code_data", code_data)
+    elif select_dataset == "boolq":
+        boolq_data = load_dataset("json", data_files="/data/zzh/olora/datasets/boolq/transformed_train.jsonl")
+        print("boolq_data", boolq_data)
+    elif select_dataset == "piqa":
+        piqa_data = load_dataset("json", data_files="/data/zzh/olora/datasets/piqa/transformed_train.jsonl")
+        print("piqa_data", piqa_data)
+    elif select_dataset == "tsa":
+        tsa_data = load_dataset("json", data_files="/data/zzh/olora/datasets/tsa/train_new.jsonl")
+        print("tsa_data", tsa_data)
+    elif select_dataset == "social":
+        social_data = load_dataset("json", data_files="/data/zzh/olora/datasets/social/train.jsonl")
+        print("social_data", social_data)
+    elif select_dataset == "agnews":
+        agnews_data = load_dataset("json", data_files="/data/zzh/olora/datasets/agnews/train.jsonl")
+        print("agnews_data", agnews_data)
+    elif select_dataset == "common":
+        common_data = load_dataset("json", data_files="/data/zzh/olora/datasets/common/train.jsonl")
+        print("common_data", common_data)
+    elif select_dataset == "emotion":
+        emotion_data = load_dataset("json", data_files="/data/zzh/olora/datasets/emotion/train.jsonl")
+        print("emotion_data", emotion_data)
+    elif select_dataset == "omw":
+        omw_data = load_dataset("json", data_files="/data/zzh/olora/datasets/omw/train.jsonl")
+        print("omw_data", omw_data)
+    elif select_dataset == "wino":
+        wino_data = load_dataset("json", data_files="/data/zzh/olora/datasets/wino/train.jsonl")
+        print("wino_data", wino_data)
 
-    # wealth_data = load_dataset("json", data_files="/data/zzh/olora/wealth/train.jsonl")
-    # print("wealth_data", wealth_data)
 
-    # code_data = load_dataset("json", data_files="/data/zzh/olora/code/train.jsonl")
-    # print("code_data", code_data)
-
-    # boolq_data = load_dataset("json", data_files="/data/zzh/olora/boolq/transformed_train.jsonl")
-    # print("boolq_data", boolq_data)
-
-    # piqa_data = load_dataset("json", data_files="/data/zzh/olora/piqa/transformed_train.jsonl")
-    # print("piqa_data", piqa_data)
-
-    tsa_data = load_dataset("json", data_files="/data/zzh/olora/tsa/train_new.jsonl")
-    print("tsa_data", tsa_data)
-
-    # loss: crossentropy (next word in vocabulary)
     model = LlamaForCausalLM.from_pretrained(
         base_model,
         load_in_8bit=True,
@@ -167,19 +174,19 @@ def train(
     tokenizer = LlamaTokenizer.from_pretrained(base_model)
 
     tokenizer.pad_token_id = (
-        0  # unk. we want this to be different from the eos token
+        0 # we want this to be different from the eos token
     )
-    tokenizer.padding_side = "left"  # Allow batched inference
-    # print(tokenizer.eos_token_id)
+    tokenizer.padding_side = "left" # Allow batched inference
 
     def tokenize(prompt, add_eos_token=True):
-        # there's probably a way to do this with the tokenizer settings
-        # but again, gotta move fast
+        """
+        由 prompt 文本得到分词后的 tokens
+        """
         result = tokenizer(
-            prompt,
-            truncation=True,
+            prompt, # 文本
+            truncation=True, # 如果输入 token 的长度超过 max_length，则将其截断到 max_length
             max_length=cutoff_len,
-            padding=False,
+            padding=False, # 不填充
             return_tensors=None,
         )
         if (
@@ -187,8 +194,6 @@ def train(
             and len(result["input_ids"]) < cutoff_len
             and add_eos_token
         ):
-            # print("prompt:",prompt)
-            # print("len(result[input_ids])",len(result["input_ids"]))
             result["input_ids"].append(tokenizer.eos_token_id)
             result["attention_mask"].append(1)
 
@@ -203,6 +208,7 @@ def train(
             data_point["output"],
         )
         tokenized_full_prompt = tokenize(full_prompt)
+
         if not train_on_inputs:
             user_prompt = prompter.generate_prompt(
                 data_point["instruction"], data_point["input"]
@@ -219,8 +225,8 @@ def train(
                 -100
             ] * user_prompt_len + tokenized_full_prompt["labels"][
                 user_prompt_len:
-            ]  # could be sped up, probably
-        # print(tokenized_full_prompt)
+            ]
+                # -100 表示忽略的 token，这里是为了让模型只关注输出部分的 loss
         return tokenized_full_prompt
 
     model = prepare_model_for_int8_training(model)
@@ -237,115 +243,205 @@ def train(
 
 
     if val_set_size > 0:
-
-        # # gsm8k
-        # gsm8k_train_val = gsm8k_data['train'].train_test_split(
-        #     test_size=val_set_size, shuffle=True, seed=42
-        # )
-        # gsm8k_train_data = (
-        #     gsm8k_train_val["train"].shuffle().map(generate_and_tokenize_prompt)
-        # )
-        # gsm8k_val_data = (
-        #     gsm8k_train_val["test"].shuffle().map(generate_and_tokenize_prompt)
-        # )
-
-        # # wealth
-        # wealth_train_val = wealth_data['train'].train_test_split(
-        #     test_size=val_set_size, shuffle=True, seed=42
-        # )
-        # wealth_train_data = (
-        #     wealth_train_val["train"].shuffle().map(generate_and_tokenize_prompt)
-        # )
-        # wealth_val_data = (
-        #     wealth_train_val["test"].shuffle().map(generate_and_tokenize_prompt)
-        # )
-
-        # # code
-        # code_train_val = code_data['train'].train_test_split(
-        #     test_size=val_set_size, shuffle=True, seed=42
-        # )
-        # code_train_data = (
-        #     code_train_val["train"].shuffle().map(generate_and_tokenize_prompt)
-        # )
-        # code_val_data = (
-        #     code_train_val["test"].shuffle().map(generate_and_tokenize_prompt)
-        # )
-
-        # # boolq
-        # boolq_train_val = boolq_data['train'].train_test_split(
-        #     test_size=val_set_size, shuffle=True, seed=42
-        # )
-        # boolq_train_data = (
-        #     boolq_train_val["train"].shuffle().map(generate_and_tokenize_prompt)
-        # )
-        # boolq_val_data = (
-        #     boolq_train_val["test"].shuffle().map(generate_and_tokenize_prompt)
-        # )
-
-        # # piqa
-        # piqa_train_val = piqa_data['train'].train_test_split(
-        #     test_size=val_set_size, shuffle=True, seed=42
-        # )
-        # piqa_train_data = (
-        #     piqa_train_val["train"].shuffle().map(generate_and_tokenize_prompt)
-        # )
-        # piqa_val_data = (
-        #     piqa_train_val["test"].shuffle().map(generate_and_tokenize_prompt)
-        # )
-
-        # tsa
-        tsa_train_val = tsa_data['train'].train_test_split(
-            test_size=val_set_size, shuffle=True, seed=42
-        )
-        tsa_train_data = (
-            tsa_train_val["train"].shuffle().map(generate_and_tokenize_prompt)
-        )
-        tsa_val_data = (
-            tsa_train_val["test"].shuffle().map(generate_and_tokenize_prompt)
-        )
+        if select_dataset == "gsm8k":
+            # gsm8k
+            gsm8k_train_val = gsm8k_data['train'].train_test_split(
+                test_size=val_set_size, shuffle=True, seed=42
+            )
+            gsm8k_train_data = (
+                gsm8k_train_val["train"].shuffle().map(generate_and_tokenize_prompt)
+            )
+            gsm8k_val_data = (
+                gsm8k_train_val["test"].shuffle().map(generate_and_tokenize_prompt)
+            )
+        elif select_dataset == "wealth":
+            # wealth
+            wealth_train_val = wealth_data['train'].train_test_split(
+                test_size=val_set_size, shuffle=True, seed=42
+            )
+            wealth_train_data = (
+                wealth_train_val["train"].shuffle().map(generate_and_tokenize_prompt)
+            )
+            wealth_val_data = (
+                wealth_train_val["test"].shuffle().map(generate_and_tokenize_prompt)
+            )
+        elif select_dataset == "code":
+            # code
+            code_train_val = code_data['train'].train_test_split(
+                test_size=val_set_size, shuffle=True, seed=42
+            )
+            code_train_data = (
+                code_train_val["train"].shuffle().map(generate_and_tokenize_prompt)
+            )
+            code_val_data = (
+                code_train_val["test"].shuffle().map(generate_and_tokenize_prompt)
+            )
+        elif select_dataset == "boolq":
+            # boolq
+            boolq_train_val = boolq_data['train'].train_test_split(
+                test_size=val_set_size, shuffle=True, seed=42
+            )
+            boolq_train_data = (
+                boolq_train_val["train"].shuffle().map(generate_and_tokenize_prompt)
+            )
+            boolq_val_data = (
+                boolq_train_val["test"].shuffle().map(generate_and_tokenize_prompt)
+            )
+        elif select_dataset == "piqa":
+            # piqa
+            piqa_train_val = piqa_data['train'].train_test_split(
+                test_size=val_set_size, shuffle=True, seed=42
+            )
+            piqa_train_data = (
+                piqa_train_val["train"].shuffle().map(generate_and_tokenize_prompt)
+            )
+            piqa_val_data = (
+                piqa_train_val["test"].shuffle().map(generate_and_tokenize_prompt)
+            )
+        elif select_dataset == "tsa":
+            # tsa
+            tsa_train_val = tsa_data['train'].train_test_split(
+                test_size=val_set_size, shuffle=True, seed=42
+            )
+            tsa_train_data = (
+                tsa_train_val["train"].shuffle().map(generate_and_tokenize_prompt)
+            )
+            tsa_val_data = (
+                tsa_train_val["test"].shuffle().map(generate_and_tokenize_prompt)
+            )
+        elif select_dataset == "social":
+            # social
+            social_train_val = social_data['train'].train_test_split(
+                test_size=val_set_size, shuffle=True, seed=42
+            )
+            social_train_data = (
+                social_train_val["train"].shuffle().map(generate_and_tokenize_prompt)
+            )
+            social_val_data = (
+                social_train_val["test"].shuffle().map(generate_and_tokenize_prompt)
+            )
+        elif select_dataset == "agnews":
+            # agnews
+            agnews_train_val = agnews_data['train'].train_test_split(
+                test_size=val_set_size, shuffle=True, seed=42
+            )
+            agnews_train_data = (
+                agnews_train_val["train"].shuffle().map(generate_and_tokenize_prompt)
+            )
+            agnews_val_data = (
+                agnews_train_val["test"].shuffle().map(generate_and_tokenize_prompt)
+            )
+        elif select_dataset == "common":
+            # common
+            common_train_val = common_data['train'].train_test_split(
+                test_size=val_set_size, shuffle=True, seed=42
+            )
+            common_train_data = (
+                common_train_val["train"].shuffle().map(generate_and_tokenize_prompt)
+            )
+            common_val_data = (
+                common_train_val["test"].shuffle().map(generate_and_tokenize_prompt)
+            )
+        elif select_dataset == "emotion":
+            # emotion
+            emotion_train_val = emotion_data['train'].train_test_split(
+                test_size=val_set_size, shuffle=True, seed=42
+            )
+            emotion_train_data = (
+                emotion_train_val["train"].shuffle().map(generate_and_tokenize_prompt)
+            )
+            emotion_val_data = (
+                emotion_train_val["test"].shuffle().map(generate_and_tokenize_prompt)
+            )
+        elif select_dataset == "omw":
+            # omw
+            omw_train_val = omw_data['train'].train_test_split(
+                test_size=val_set_size, shuffle=True, seed=42
+            )
+            omw_train_data = (
+                omw_train_val["train"].shuffle().map(generate_and_tokenize_prompt)
+            )
+            omw_val_data = (
+                omw_train_val["test"].shuffle().map(generate_and_tokenize_prompt)
+            )
+        elif select_dataset == "wino":
+            # wino
+            wino_train_val = wino_data['train'].train_test_split(
+                test_size=val_set_size, shuffle=True, seed=42
+            )
+            wino_train_data = (
+                wino_train_val["train"].shuffle().map(generate_and_tokenize_prompt)
+            )
+            wino_val_data = (
+                wino_train_val["test"].shuffle().map(generate_and_tokenize_prompt)
+            )
 
     else:
-
-        # # gsm8k
-        # gsm8k_train_data = gsm8k_data["train"].shuffle().map(generate_and_tokenize_prompt)
-        # gsm8k_val_data = None
-
-        # # wealth
-        # wealth_train_data = wealth_data["train"].shuffle().map(generate_and_tokenize_prompt)
-        # wealth_val_data = None
-
-        # # code
-        # code_train_data = code_data["train"].shuffle().map(generate_and_tokenize_prompt)
-        # code_val_data = None
-
-        # # boolq
-        # boolq_train_data = boolq_data["train"].shuffle().map(generate_and_tokenize_prompt)
-        # boolq_val_data = None
-
-        # # piqa
-        # piqa_train_data = piqa_data["train"].shuffle().map(generate_and_tokenize_prompt)
-        # piqa_val_data = None
-
-        # tsa
-        tsa_train_data = tsa_data["train"].shuffle().map(generate_and_tokenize_prompt)
-        tsa_val_data = None
-
+        if select_dataset == "gsm8k":
+            # gsm8k
+            gsm8k_train_data = gsm8k_data["train"].shuffle().map(generate_and_tokenize_prompt)
+            gsm8k_val_data = None
+        elif select_dataset == "wealth":
+            # wealth
+            wealth_train_data = wealth_data["train"].shuffle().map(generate_and_tokenize_prompt)
+            wealth_val_data = None
+        elif select_dataset == "code":
+            # code
+            code_train_data = code_data["train"].shuffle().map(generate_and_tokenize_prompt)
+            code_val_data = None
+        elif select_dataset == "boolq":
+            # boolq
+            boolq_train_data = boolq_data["train"].shuffle().map(generate_and_tokenize_prompt)
+            boolq_val_data = None
+        elif select_dataset == "piqa":
+            # piqa
+            piqa_train_data = piqa_data["train"].shuffle().map(generate_and_tokenize_prompt)
+            piqa_val_data = None
+        elif select_dataset == "tsa":
+            # tsa
+            tsa_train_data = tsa_data["train"].shuffle().map(generate_and_tokenize_prompt)
+            tsa_val_data = None
+        elif select_dataset == "social":
+            # social
+            social_train_data = social_data["train"].shuffle().map(generate_and_tokenize_prompt)
+            social_val_data = None
+        elif select_dataset == "agnews":
+            # agnews
+            agnews_train_data = agnews_data["train"].shuffle().map(generate_and_tokenize_prompt)
+            agnews_val_data = None
+        elif select_dataset == "common":
+            # common
+            common_train_data = common_data["train"].shuffle().map(generate_and_tokenize_prompt)
+            common_val_data = None
+        elif select_dataset == "emotion":
+            # emotion
+            emotion_train_data = emotion_data["train"].shuffle().map(generate_and_tokenize_prompt)
+            emotion_val_data = None
+        elif select_dataset == "omw":
+            # omw
+            omw_train_data = omw_data["train"].shuffle().map(generate_and_tokenize_prompt)
+            omw_val_data = None
+        elif select_dataset == "wino":
+            # wino
+            wino_train_data = wino_data["train"].shuffle().map(generate_and_tokenize_prompt)
+            wino_val_data = None
 
 
     if resume_from_checkpoint:
+        # 从 checkpoint 恢复模型训练
         print("check if there is available checkpoint")
-        # Check the available weights and load them
         checkpoint_name = os.path.join(
             resume_from_checkpoint, "pytorch_model.bin"
-        )  # Full checkpoint
+        ) # Full checkpoint
         if not os.path.exists(checkpoint_name):
             checkpoint_name = os.path.join(
                 resume_from_checkpoint, "adapter_model.bin"
-            )  # only LoRA model - LoRA config above has to fit
+            ) # only LoRA model - LoRA config above has to fit
             resume_from_checkpoint = (
-                False  # So the trainer won't try loading its state
+                False # So the trainer won't try loading its state
             )
         # The two files above have a different name depending on how they were saved, but are actually the same.
+        
         if os.path.exists(checkpoint_name):
             print(f"Restarting from {checkpoint_name}")
             adapters_weights = torch.load(checkpoint_name)
@@ -353,14 +449,14 @@ def train(
         else:
             print(f"Checkpoint {checkpoint_name} not found")
 
-    model.print_trainable_parameters()  # Be more transparent about the % of trainable params.
+    model.print_trainable_parameters()
 
     if not ddp and torch.cuda.device_count() > 1:
         print("not ddp and torch.cuda.device_count() > 1:")
         # keeps Trainer from trying its own DataParallelism when more than 1 gpu is available
         model.is_parallelizable = True
         model.model_parallel = True
-    
+
     model.config.use_cache = False
 
     old_state_dict = model.state_dict
@@ -378,257 +474,486 @@ def train(
 
 
 
-    # wandb.init(project="debug", name="gsm8k"+wandb_version, reinit=True)
-    # gsm8k_output_dir = output_dir + "/gsm8k"
-    # gsm8k_trainer = transformers.Trainer(
-    #     model=model,
-    #     train_dataset=gsm8k_train_data, #
-    #     eval_dataset=gsm8k_val_data, #
-    #     args=transformers.TrainingArguments(
-    #         per_device_train_batch_size=micro_batch_size,
-    #         per_device_eval_batch_size=micro_batch_size,
-    #         gradient_accumulation_steps=gradient_accumulation_steps,
-    #         warmup_steps=0,
-    #         num_train_epochs=1,
-    #         learning_rate=learning_rate,
-    #         fp16=True,
-    #         logging_steps=5,
-    #         optim="adamw_torch",
-    #         evaluation_strategy="steps" if val_set_size > 0 else "no",
-    #         save_strategy="steps",
-    #         eval_steps=10 if val_set_size > 0 else None,
-    #         # eval_steps=200 if val_set_size > 0 else None,
-    #         save_steps=40,
-    #         output_dir=gsm8k_output_dir,
-    #         save_total_limit=1,
-    #         load_best_model_at_end=True if val_set_size > 0 else False,
-    #         ddp_find_unused_parameters=False if ddp else None,
-    #         group_by_length=group_by_length,
-    #         report_to="wandb" if use_wandb else None,
-    #         run_name="gsm8k"+wandb_version if use_wandb else None,
-    #     ),
-    #     data_collator=transformers.DataCollatorForSeq2Seq(
-    #         tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
-    #     ),
-    # )
-    # gsm8k_trainer.train()
-    # print("lora.default\n", model.model.model.layers[31].self_attn.v_proj.lora_B["default"].weight)
+    # for name, param in model.named_parameters():
+    #     if "lora_tau" in name:
+    #         print(name, "\t", param)
+    #     elif "mean" in name:
+    #         print(name, "\t", param)
+    #     elif "lora_feature_cov" in name:
+    #         print(name, "\t", param)
+    #     elif "lora_cov" in name:
+    #         print(name, "\t", param)
 
 
 
 
+    if select_dataset == "gsm8k":
+        wandb.init(project="debug", name="gsm8k"+wandb_version, reinit=True)
+        gsm8k_output_dir = output_dir + "/gsm8k"
+        gsm8k_trainer = MyTrainer(
+            model=model,
+            train_dataset=gsm8k_train_data, #
+            eval_dataset=gsm8k_val_data, #
+            args=transformers.TrainingArguments(
+                per_device_train_batch_size=micro_batch_size,
+                per_device_eval_batch_size=micro_batch_size,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                warmup_steps=0,
+                num_train_epochs=1,
+                learning_rate=learning_rate,
+                fp16=True,
+                logging_steps=5,
+                optim="adamw_torch",
+                evaluation_strategy="steps" if val_set_size > 0 else "no",
+                save_strategy="steps",
+                eval_steps=10 if val_set_size > 0 else None,
+                save_steps=40,
+                output_dir=gsm8k_output_dir,
+                save_total_limit=1,
+                load_best_model_at_end=True if val_set_size > 0 else False,
+                ddp_find_unused_parameters=False if ddp else None,
+                group_by_length=group_by_length,
+                report_to="wandb" if use_wandb else None,
+                run_name="gsm8k"+wandb_version if use_wandb else None,
+            ),
+            data_collator=transformers.DataCollatorForSeq2Seq(
+                tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
+            ),
+        )
+        gsm8k_trainer.train()
+        print("have trained gsm8k")
 
+    elif select_dataset == "wealth":
+        wandb.init(project="debug", name="wealth"+wandb_version, reinit=True)
+        wealth_output_dir = output_dir + "/wealth"
+        wealth_trainer = transformers.Trainer(
+            model=model,
+            train_dataset=wealth_train_data, #
+            eval_dataset=wealth_val_data, #
+            args=transformers.TrainingArguments(
+                per_device_train_batch_size=micro_batch_size,
+                per_device_eval_batch_size=micro_batch_size,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                warmup_steps=0,
+                num_train_epochs=1,
+                learning_rate=learning_rate,
+                fp16=True,
+                logging_steps=5,
+                optim="adamw_torch",
+                evaluation_strategy="steps" if val_set_size > 0 else "no",
+                save_strategy="steps",
+                eval_steps=10 if val_set_size > 0 else None,
+                # eval_steps=200 if val_set_size > 0 else None,
+                save_steps=40,
+                output_dir=wealth_output_dir,
+                save_total_limit=1,
+                load_best_model_at_end=True if val_set_size > 0 else False,
+                ddp_find_unused_parameters=False if ddp else None,
+                group_by_length=group_by_length,
+                report_to="wandb" if use_wandb else None,
+                run_name="wealth"+wandb_version if use_wandb else None,
+            ),
+            data_collator=transformers.DataCollatorForSeq2Seq(
+                tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
+            ),
+        )
+        wealth_trainer.train()
+        print("have trained wealth")
 
+    elif select_dataset == "code":
+        wandb.init(project="debug", name="code"+wandb_version, reinit=True)
+        code_output_dir = output_dir + "/code"
+        code_trainer = transformers.Trainer(
+            model=model,
+            train_dataset=code_train_data, #
+            eval_dataset=code_val_data, #
+            args=transformers.TrainingArguments(
+                per_device_train_batch_size=micro_batch_size,
+                per_device_eval_batch_size=micro_batch_size,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                warmup_steps=0,
+                num_train_epochs=1,
+                learning_rate=learning_rate,
+                fp16=True,
+                logging_steps=5,
+                optim="adamw_torch",
+                evaluation_strategy="steps" if val_set_size > 0 else "no",
+                save_strategy="steps",
+                eval_steps=10 if val_set_size > 0 else None,
+                # eval_steps=200 if val_set_size > 0 else None,
+                save_steps=40,
+                output_dir=code_output_dir,
+                save_total_limit=1,
+                load_best_model_at_end=True if val_set_size > 0 else False,
+                ddp_find_unused_parameters=False if ddp else None,
+                group_by_length=group_by_length,
+                report_to="wandb" if use_wandb else None,
+                run_name="code"+wandb_version if use_wandb else None,
+            ),
+            data_collator=transformers.DataCollatorForSeq2Seq(
+                tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
+            ),
+        )
+        code_trainer.train()
+        print("have trained code")
 
-    # wandb.init(project="debug", name="wealth"+wandb_version, reinit=True)
-    # wealth_output_dir = output_dir + "/wealth"
-    # wealth_trainer = transformers.Trainer(
-    #     model=model,
-    #     train_dataset=wealth_train_data, #
-    #     eval_dataset=wealth_val_data, #
-    #     args=transformers.TrainingArguments(
-    #         per_device_train_batch_size=micro_batch_size,
-    #         per_device_eval_batch_size=micro_batch_size,
-    #         gradient_accumulation_steps=gradient_accumulation_steps,
-    #         warmup_steps=0,
-    #         num_train_epochs=1,
-    #         learning_rate=learning_rate,
-    #         fp16=True,
-    #         logging_steps=5,
-    #         optim="adamw_torch",
-    #         evaluation_strategy="steps" if val_set_size > 0 else "no",
-    #         save_strategy="steps",
-    #         eval_steps=10 if val_set_size > 0 else None,
-    #         # eval_steps=200 if val_set_size > 0 else None,
-    #         save_steps=40,
-    #         output_dir=wealth_output_dir,
-    #         save_total_limit=1,
-    #         load_best_model_at_end=True if val_set_size > 0 else False,
-    #         ddp_find_unused_parameters=False if ddp else None,
-    #         group_by_length=group_by_length,
-    #         report_to="wandb" if use_wandb else None,
-    #         run_name="wealth"+wandb_version if use_wandb else None,
-    #     ),
-    #     data_collator=transformers.DataCollatorForSeq2Seq(
-    #         tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
-    #     ),
-    # )
-    # wealth_trainer.train()
-
-
-
-
-
-
-
-    # wandb.init(project="debug", name="code"+wandb_version, reinit=True)
-    # code_output_dir = output_dir + "/code"
-    # code_trainer = transformers.Trainer(
-    #     model=model,
-    #     train_dataset=code_train_data, #
-    #     eval_dataset=code_val_data, #
-    #     args=transformers.TrainingArguments(
-    #         per_device_train_batch_size=micro_batch_size,
-    #         per_device_eval_batch_size=micro_batch_size,
-    #         gradient_accumulation_steps=gradient_accumulation_steps,
-    #         warmup_steps=0,
-    #         num_train_epochs=1,
-    #         learning_rate=learning_rate,
-    #         fp16=True,
-    #         logging_steps=5,
-    #         optim="adamw_torch",
-    #         evaluation_strategy="steps" if val_set_size > 0 else "no",
-    #         save_strategy="steps",
-    #         eval_steps=10 if val_set_size > 0 else None,
-    #         # eval_steps=200 if val_set_size > 0 else None,
-    #         save_steps=40,
-    #         output_dir=code_output_dir,
-    #         save_total_limit=1,
-    #         load_best_model_at_end=True if val_set_size > 0 else False,
-    #         ddp_find_unused_parameters=False if ddp else None,
-    #         group_by_length=group_by_length,
-    #         report_to="wandb" if use_wandb else None,
-    #         run_name="code"+wandb_version if use_wandb else None,
-    #     ),
-    #     data_collator=transformers.DataCollatorForSeq2Seq(
-    #         tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
-    #     ),
-    # )
-    # code_trainer.train()
-
-
-
-
-
-
-
-
-    # wandb.init(project="debug", name="boolq"+wandb_version, reinit=True)
-    # boolq_output_dir = output_dir + "/boolq"
-    # boolq_trainer = transformers.Trainer(
-    #     model=model,
-    #     train_dataset=boolq_train_data, #
-    #     eval_dataset=boolq_val_data, #
-    #     args=transformers.TrainingArguments(
-    #         per_device_train_batch_size=micro_batch_size,
-    #         per_device_eval_batch_size=micro_batch_size,
-    #         gradient_accumulation_steps=gradient_accumulation_steps,
-    #         warmup_steps=0,
-    #         num_train_epochs=1,
-    #         learning_rate=learning_rate,
-    #         fp16=True,
-    #         logging_steps=5,
-    #         optim="adamw_torch",
-    #         evaluation_strategy="steps" if val_set_size > 0 else "no",
-    #         save_strategy="steps",
-    #         eval_steps=10 if val_set_size > 0 else None,
-    #         # eval_steps=200 if val_set_size > 0 else None,
-    #         save_steps=40,
-    #         output_dir=boolq_output_dir,
-    #         save_total_limit=1,
-    #         load_best_model_at_end=True if val_set_size > 0 else False,
-    #         ddp_find_unused_parameters=False if ddp else None,
-    #         group_by_length=group_by_length,
-    #         report_to="wandb" if use_wandb else None,
-    #         run_name="boolq"+wandb_version if use_wandb else None,
-    #     ),
-    #     data_collator=transformers.DataCollatorForSeq2Seq(
-    #         tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
-    #     ),
-    # )
-    # boolq_trainer.train()
-    # print("lora.default\n", model.model.model.layers[31].self_attn.v_proj.lora_B["default"].weight)
+    elif select_dataset == "boolq":
+        wandb.init(project="debug", name="boolq"+wandb_version, reinit=True)
+        boolq_output_dir = output_dir + "/boolq"
+        boolq_trainer = transformers.Trainer(
+            model=model,
+            train_dataset=boolq_train_data, #
+            eval_dataset=boolq_val_data, #
+            args=transformers.TrainingArguments(
+                per_device_train_batch_size=micro_batch_size,
+                per_device_eval_batch_size=micro_batch_size,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                warmup_steps=0,
+                num_train_epochs=1,
+                learning_rate=learning_rate,
+                fp16=True,
+                logging_steps=5,
+                optim="adamw_torch",
+                evaluation_strategy="steps" if val_set_size > 0 else "no",
+                save_strategy="steps",
+                eval_steps=10 if val_set_size > 0 else None,
+                # eval_steps=200 if val_set_size > 0 else None,
+                save_steps=40,
+                output_dir=boolq_output_dir,
+                save_total_limit=1,
+                load_best_model_at_end=True if val_set_size > 0 else False,
+                ddp_find_unused_parameters=False if ddp else None,
+                group_by_length=group_by_length,
+                report_to="wandb" if use_wandb else None,
+                run_name="boolq"+wandb_version if use_wandb else None,
+            ),
+            data_collator=transformers.DataCollatorForSeq2Seq(
+                tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
+            ),
+        )
+        boolq_trainer.train()
+        print("have trained boolq")
     
+    elif select_dataset == "piqa":
+        wandb.init(project="debug", name="piqa"+wandb_version, reinit=True)
+        piqa_output_dir = output_dir + "/piqa"
+        piqa_trainer = transformers.Trainer(
+            model=model,
+            train_dataset=piqa_train_data, #
+            eval_dataset=piqa_val_data, #
+            args=transformers.TrainingArguments(
+                per_device_train_batch_size=micro_batch_size,
+                per_device_eval_batch_size=micro_batch_size,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                warmup_steps=0,
+                num_train_epochs=1,
+                learning_rate=learning_rate,
+                fp16=True,
+                logging_steps=5,
+                optim="adamw_torch",
+                evaluation_strategy="steps" if val_set_size > 0 else "no",
+                save_strategy="steps",
+                eval_steps=10 if val_set_size > 0 else None,
+                # eval_steps=200 if val_set_size > 0 else None,
+                save_steps=40,
+                output_dir=piqa_output_dir,
+                save_total_limit=1,
+                load_best_model_at_end=True if val_set_size > 0 else False,
+                ddp_find_unused_parameters=False if ddp else None,
+                group_by_length=group_by_length,
+                report_to="wandb" if use_wandb else None,
+                run_name="piqa"+wandb_version if use_wandb else None,
+            ),
+            data_collator=transformers.DataCollatorForSeq2Seq(
+                tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
+            ),
+        )
+        piqa_trainer.train()
+        print("have trained piqa")
+
+    elif select_dataset == "tsa":
+        wandb.init(project="debug", name="tsa"+wandb_version, reinit=True)
+        tsa_output_dir = output_dir + "/tsa"
+        tsa_trainer = transformers.Trainer(
+            model=model,
+            train_dataset=tsa_train_data, #
+            eval_dataset=tsa_val_data, #
+            args=transformers.TrainingArguments(
+                per_device_train_batch_size=micro_batch_size,
+                per_device_eval_batch_size=micro_batch_size,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                warmup_steps=0,
+                num_train_epochs=1,
+                learning_rate=learning_rate,
+                fp16=True,
+                logging_steps=5,
+                optim="adamw_torch",
+                evaluation_strategy="steps" if val_set_size > 0 else "no",
+                save_strategy="steps",
+                eval_steps=10 if val_set_size > 0 else None,
+                # eval_steps=200 if val_set_size > 0 else None,
+                save_steps=40,
+                output_dir=tsa_output_dir,
+                save_total_limit=1,
+                load_best_model_at_end=True if val_set_size > 0 else False,
+                ddp_find_unused_parameters=False if ddp else None,
+                group_by_length=group_by_length,
+                report_to="wandb" if use_wandb else None,
+                run_name="tsa"+wandb_version if use_wandb else None,
+            ),
+            data_collator=transformers.DataCollatorForSeq2Seq(
+                tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
+            ),
+        )
+        tsa_trainer.train()
+        print("have trained tsa")
+    
+    elif select_dataset == "social":
+        wandb.init(project="debug", name="social"+wandb_version, reinit=True)
+        social_output_dir = output_dir + "/social"
+        social_trainer = transformers.Trainer(
+            model=model,
+            train_dataset=social_train_data, #
+            eval_dataset=social_val_data, #
+            args=transformers.TrainingArguments(
+                per_device_train_batch_size=micro_batch_size,
+                per_device_eval_batch_size=micro_batch_size,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                warmup_steps=0,
+                num_train_epochs=1,
+                learning_rate=learning_rate,
+                fp16=True,
+                logging_steps=5,
+                optim="adamw_torch",
+                evaluation_strategy="steps" if val_set_size > 0 else "no",
+                save_strategy="steps",
+                eval_steps=10 if val_set_size > 0 else None,
+                # eval_steps=200 if val_set_size > 0 else None,
+                save_steps=40,
+                output_dir=social_output_dir,
+                save_total_limit=1,
+                load_best_model_at_end=True if val_set_size > 0 else False,
+                ddp_find_unused_parameters=False if ddp else None,
+                group_by_length=group_by_length,
+                report_to="wandb" if use_wandb else None,
+                run_name="social"+wandb_version if use_wandb else None,
+            ),
+            data_collator=transformers.DataCollatorForSeq2Seq(
+                tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
+            ),
+        )
+        social_trainer.train()
+        print("have trained social")
+    
+    elif select_dataset == "agnews":
+        wandb.init(project="debug", name="agnews"+wandb_version, reinit=True)
+        agnews_output_dir = output_dir + "/agnews"
+        agnews_trainer = transformers.Trainer(
+            model=model,
+            train_dataset=agnews_train_data, #
+            eval_dataset=agnews_val_data, #
+            args=transformers.TrainingArguments(
+                per_device_train_batch_size=micro_batch_size,
+                per_device_eval_batch_size=micro_batch_size,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                warmup_steps=0,
+                num_train_epochs=1,
+                learning_rate=learning_rate,
+                fp16=True,
+                logging_steps=5,
+                optim="adamw_torch",
+                evaluation_strategy="steps" if val_set_size > 0 else "no",
+                save_strategy="steps",
+                eval_steps=10 if val_set_size > 0 else None,
+                # eval_steps=200 if val_set_size > 0 else None,
+                save_steps=40,
+                output_dir=agnews_output_dir,
+                save_total_limit=1,
+                load_best_model_at_end=True if val_set_size > 0 else False,
+                ddp_find_unused_parameters=False if ddp else None,
+                group_by_length=group_by_length,
+                report_to="wandb" if use_wandb else None,
+                run_name="agnews"+wandb_version if use_wandb else None,
+            ),
+            data_collator=transformers.DataCollatorForSeq2Seq(
+                tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
+            ),
+        )
+        agnews_trainer.train()
+        print("have trained agnews")
+    
+    elif select_dataset == "common":
+        wandb.init(project="debug", name="common"+wandb_version, reinit=True)
+        common_output_dir = output_dir + "/common"
+        common_trainer = transformers.Trainer(
+            model=model,
+            train_dataset=common_train_data, #
+            eval_dataset=common_val_data, #
+            args=transformers.TrainingArguments(
+                per_device_train_batch_size=micro_batch_size,
+                per_device_eval_batch_size=micro_batch_size,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                warmup_steps=0,
+                num_train_epochs=1,
+                learning_rate=learning_rate,
+                fp16=True,
+                logging_steps=5,
+                optim="adamw_torch",
+                evaluation_strategy="steps" if val_set_size > 0 else "no",
+                save_strategy="steps",
+                eval_steps=10 if val_set_size > 0 else None,
+                # eval_steps=200 if val_set_size > 0 else None,
+                save_steps=40,
+                output_dir=common_output_dir,
+                save_total_limit=1,
+                load_best_model_at_end=True if val_set_size > 0 else False,
+                ddp_find_unused_parameters=False if ddp else None,
+                group_by_length=group_by_length,
+                report_to="wandb" if use_wandb else None,
+                run_name="common"+wandb_version if use_wandb else None,
+            ),
+            data_collator=transformers.DataCollatorForSeq2Seq(
+                tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
+            ),
+        )
+        common_trainer.train()
+        print("have trained common")
+    
+    elif select_dataset == "emotion":
+        wandb.init(project="debug", name="emotion"+wandb_version, reinit=True)
+        emotion_output_dir = output_dir + "/emotion"
+        emotion_trainer = transformers.Trainer(
+            model=model,
+            train_dataset=emotion_train_data, #
+            eval_dataset=emotion_val_data, #
+            args=transformers.TrainingArguments(
+                per_device_train_batch_size=micro_batch_size,
+                per_device_eval_batch_size=micro_batch_size,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                warmup_steps=0,
+                num_train_epochs=1,
+                learning_rate=learning_rate,
+                fp16=True,
+                logging_steps=5,
+                optim="adamw_torch",
+                evaluation_strategy="steps" if val_set_size > 0 else "no",
+                save_strategy="steps",
+                eval_steps=10 if val_set_size > 0 else None,
+                # eval_steps=200 if val_set_size > 0 else None,
+                save_steps=40,
+                output_dir=emotion_output_dir,
+                save_total_limit=1,
+                load_best_model_at_end=True if val_set_size > 0 else False,
+                ddp_find_unused_parameters=False if ddp else None,
+                group_by_length=group_by_length,
+                report_to="wandb" if use_wandb else None,
+                run_name="emotion"+wandb_version if use_wandb else None,
+            ),
+            data_collator=transformers.DataCollatorForSeq2Seq(
+                tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
+            ),
+        )
+        emotion_trainer.train()
+        print("have trained emotion")
+    
+    elif select_dataset == "omw":
+        wandb.init(project="debug", name="omw"+wandb_version, reinit=True)
+        omw_output_dir = output_dir + "/omw"
+        omw_trainer = transformers.Trainer(
+            model=model,
+            train_dataset=omw_train_data, #
+            eval_dataset=omw_val_data, #
+            args=transformers.TrainingArguments(
+                per_device_train_batch_size=micro_batch_size,
+                per_device_eval_batch_size=micro_batch_size,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                warmup_steps=0,
+                num_train_epochs=1,
+                learning_rate=learning_rate,
+                fp16=True,
+                logging_steps=5,
+                optim="adamw_torch",
+                evaluation_strategy="steps" if val_set_size > 0 else "no",
+                save_strategy="steps",
+                eval_steps=10 if val_set_size > 0 else None,
+                # eval_steps=200 if val_set_size > 0 else None,
+                save_steps=40,
+                output_dir=omw_output_dir,
+                save_total_limit=1,
+                load_best_model_at_end=True if val_set_size > 0 else False,
+                ddp_find_unused_parameters=False if ddp else None,
+                group_by_length=group_by_length,
+                report_to="wandb" if use_wandb else None,
+                run_name="omw"+wandb_version if use_wandb else None,
+            ),
+            data_collator=transformers.DataCollatorForSeq2Seq(
+                tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
+            ),
+        )
+        omw_trainer.train()
+        print("have trained omw")
+    
+    elif select_dataset == "wino":
+        wandb.init(project="debug", name="wino"+wandb_version, reinit=True)
+        wino_output_dir = output_dir + "/wino"
+        wino_trainer = transformers.Trainer(
+            model=model,
+            train_dataset=wino_train_data, #
+            eval_dataset=wino_val_data, #
+            args=transformers.TrainingArguments(
+                per_device_train_batch_size=micro_batch_size,
+                per_device_eval_batch_size=micro_batch_size,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                warmup_steps=0,
+                num_train_epochs=1,
+                learning_rate=learning_rate,
+                fp16=True,
+                logging_steps=5,
+                optim="adamw_torch",
+                evaluation_strategy="steps" if val_set_size > 0 else "no",
+                save_strategy="steps",
+                eval_steps=10 if val_set_size > 0 else None,
+                # eval_steps=200 if val_set_size > 0 else None,
+                save_steps=40,
+                output_dir=wino_output_dir,
+                save_total_limit=1,
+                load_best_model_at_end=True if val_set_size > 0 else False,
+                ddp_find_unused_parameters=False if ddp else None,
+                group_by_length=group_by_length,
+                report_to="wandb" if use_wandb else None,
+                run_name="wino"+wandb_version if use_wandb else None,
+            ),
+            data_collator=transformers.DataCollatorForSeq2Seq(
+                tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
+            ),
+        )
+        wino_trainer.train()
+        print("have trained wino")
 
 
 
 
-
-
-
-
-    # wandb.init(project="debug", name="piqa"+wandb_version, reinit=True)
-    # piqa_output_dir = output_dir + "/piqa"
-    # piqa_trainer = transformers.Trainer(
-    #     model=model,
-    #     train_dataset=piqa_train_data, #
-    #     eval_dataset=piqa_val_data, #
-    #     args=transformers.TrainingArguments(
-    #         per_device_train_batch_size=micro_batch_size,
-    #         per_device_eval_batch_size=micro_batch_size,
-    #         gradient_accumulation_steps=gradient_accumulation_steps,
-    #         warmup_steps=0,
-    #         num_train_epochs=1,
-    #         learning_rate=learning_rate,
-    #         fp16=True,
-    #         logging_steps=5,
-    #         optim="adamw_torch",
-    #         evaluation_strategy="steps" if val_set_size > 0 else "no",
-    #         save_strategy="steps",
-    #         eval_steps=10 if val_set_size > 0 else None,
-    #         # eval_steps=200 if val_set_size > 0 else None,
-    #         save_steps=40,
-    #         output_dir=piqa_output_dir,
-    #         save_total_limit=1,
-    #         load_best_model_at_end=True if val_set_size > 0 else False,
-    #         ddp_find_unused_parameters=False if ddp else None,
-    #         group_by_length=group_by_length,
-    #         report_to="wandb" if use_wandb else None,
-    #         run_name="piqa"+wandb_version if use_wandb else None,
-    #     ),
-    #     data_collator=transformers.DataCollatorForSeq2Seq(
-    #         tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
-    #     ),
-    # )
-    # piqa_trainer.train()
-    # print("lora.default\n", model.model.model.layers[31].self_attn.v_proj.lora_B["default"].weight)
-
-
-
-
-
-
-
-    wandb.init(project="debug", name="tsa"+wandb_version, reinit=True)
-    tsa_output_dir = output_dir + "/tsa"
-    tsa_trainer = transformers.Trainer(
-        model=model,
-        train_dataset=tsa_train_data, #
-        eval_dataset=tsa_val_data, #
-        args=transformers.TrainingArguments(
-            per_device_train_batch_size=micro_batch_size,
-            per_device_eval_batch_size=micro_batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            warmup_steps=0,
-            num_train_epochs=1,
-            learning_rate=learning_rate,
-            fp16=True,
-            logging_steps=5,
-            optim="adamw_torch",
-            evaluation_strategy="steps" if val_set_size > 0 else "no",
-            save_strategy="steps",
-            eval_steps=10 if val_set_size > 0 else None,
-            # eval_steps=200 if val_set_size > 0 else None,
-            save_steps=40,
-            output_dir=tsa_output_dir,
-            save_total_limit=1,
-            load_best_model_at_end=True if val_set_size > 0 else False,
-            ddp_find_unused_parameters=False if ddp else None,
-            group_by_length=group_by_length,
-            report_to="wandb" if use_wandb else None,
-            run_name="tsa"+wandb_version if use_wandb else None,
-        ),
-        data_collator=transformers.DataCollatorForSeq2Seq(
-            tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
-        ),
-    )
-    tsa_trainer.train()
-    print("lora.default\n", model.model.model.layers[31].self_attn.v_proj.lora_B["default"].weight)
-
-
-
-
-
+    # for name, param in model.named_parameters():
+    #     if "lora_tau" in name:
+    #         print(name, "\t", param)
+    #     elif "mean" in name:
+    #         print(name, "\t", param)
+    #     elif "lora_feature_cov" in name:
+    #         print(name, "\t", param)
+    #     elif "lora_cov" in name:
+    #         print(name, "\t", param)
+    
+    # print("\n\n\n\n\n\n\n\n")
+    # print("lora_m_cov")
+    # print("\n")
+    # for name, param in model.named_parameters():
+    #     if "lora_m_cov" in name:
+    #         print(name)
+    #         print(param[0])
+    #         print(param[1])
+    #         print(param[2])
+    #         print(param[3])
+    # print("\n\n\n\n\n\n\n\n")
 
     print("saving pretrained")
     model.save_pretrained(output_dir)
