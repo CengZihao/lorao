@@ -2,32 +2,23 @@
 set -x
 
 export CUDA_DEVICE_ORDER="PCI_BUS_ID"
-export CUDA_VISIBLE_DEVICES="1,2,3,4,5,6"
+export CUDA_VISIBLE_DEVICES="1,4,7"
 
-# bash run_ft.sh
-
-version="0115_v3_tsa_tau-15"
+version="0325_v4_task1"
 
 echo -e "==================================================\n" \
     "$version\n" \
-    "tsa tau -15\n" \
+    "tsa\n" \
     "==================================================\n\n" \
     > log/$version.log
 
-# /data/zzh/d2l/miniconda3/envs/lorao/bin/python /data/zzh/olora/finetune.py \
-#     --output_dir "./lora-alpaca/$version" \
-#     >> log/$version.log 2>&1
-
-/data/zzh/d2l/miniconda3/envs/lorao/bin/python /data/zzh/olora/finetune.py \
+/data/zzh/d2l/miniconda3/envs/lorao/bin/python /data/zzh/olora/finetune_0316.py \
     --output_dir "./lora-alpaca/$version" \
-    --resume_from_checkpoint "/data/zzh/olora/lora-alpaca/0115_v1_piqa_tau-2" \
+    --select_dataset "tsa" \
     >> log/$version.log 2>&1
 
-# /data/zzh/d2l/miniconda3/envs/lora/bin/python /data/zzh/olora/finetune_traditional.py \
+# /data/zzh/d2l/miniconda3/envs/lorao/bin/python /data/zzh/olora/finetune_0316.py \
 #     --output_dir "./lora-alpaca/$version" \
-#     >> log/$version.log 2>&1
-
-# /home/zzh/miniconda3/envs/lorao/bin/python /home/zzh/olora/finetune.py \
-#     --output_dir "./lora-alpaca/$version" \
-#     --resume_from_checkpoint "/home/zzh/olora/lora-alpaca/1219_v3" \
+#     --resume_from_checkpoint "/data/zzh/olora/lora-alpaca/0325_v3_task1" \
+#     --select_dataset "boolq" \
 #     >> log/$version.log 2>&1
